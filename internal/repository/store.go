@@ -270,23 +270,63 @@ func (s *FileStore) Commit(packageID string, expectedVersion int64, eventType st
 		return err
 	}
 	line = append(line, '\n')
+	preWriteSize, err := s.logFileSize()
+	if err != nil {
+		return fmt.Errorf("测量事件日志: %w", err)
+	}
 	written, err := s.logFile.Write(line)
 	if err != nil {
 		return fmt.Errorf("追加事件: %w", err)
 	}
 	if written != len(line) {
+		s.truncateLogLocked(preWriteSize)
 		return io.ErrShortWrite
 	}
 	if err := s.logFile.Sync(); err != nil {
+		s.truncateLogLocked(preWriteSize)
 		return fmt.Errorf("同步事件日志: %w", err)
 	}
+	// 保存提交前的内存状态，便于在快照写入失败时回滚。
+	oldPackage, hadPackage := s.state.Packages[packageID]
+	oldLastSequence, oldLastHash := s.state.LastSequence, s.state.LastHash
 	s.state.Packages[packageID] = copyAggregate
 	s.state.Idempotency[idempotencyKey] = cloneRaw(result)
 	s.state.LastSequence, s.state.LastHash = event.Sequence, event.Hash
 	if err := s.writeSnapshotLocked(); err != nil {
+		// 事件日志仍可写但投影快照无法落盘时，回滚内存状态并截断已追加的事件，
+		// 保证内存状态、事件链、磁盘快照与返回结果一致：调用方收到失败后，
+		// 后续读取与幂等重试不会看到这次失败提交。
+		if hadPackage {
+			s.state.Packages[packageID] = oldPackage
+		} else {
+			delete(s.state.Packages, packageID)
+		}
+		delete(s.state.Idempotency, idempotencyKey)
+		s.state.LastSequence, s.state.LastHash = oldLastSequence, oldLastHash
+		s.truncateLogLocked(preWriteSize)
 		return err
 	}
 	return nil
+}
+
+func (s *FileStore) logFileSize() (int64, error) {
+	info, err := s.logFile.Stat()
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
+}
+
+// truncateLogLocked 截断事件日志到给定偏移并落盘，用于在快照写入失败时
+// 撤回已经追加但无法落地的事件，使事件链回到提交前的状态。
+func (s *FileStore) truncateLogLocked(size int64) {
+	if s.logFile == nil {
+		return
+	}
+	if err := s.logFile.Truncate(size); err != nil {
+		return
+	}
+	_ = s.logFile.Sync()
 }
 
 func (s *FileStore) writeSnapshotLocked() error {
