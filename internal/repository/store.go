@@ -63,7 +63,9 @@ type FileStore struct {
 	dir          string
 	logPath      string
 	snapshotPath string
+	lockPath     string
 	logFile      *os.File
+	lockFile     *os.File
 	state        snapshot
 }
 
@@ -74,17 +76,47 @@ func Open(dir string) (*FileStore, error) {
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("创建持久化目录: %w", err)
 	}
-	s := &FileStore{dir: dir, logPath: filepath.Join(dir, "events.jsonl"), snapshotPath: filepath.Join(dir, "projection.json")}
-	s.state = emptySnapshot()
-	if err := s.recover(); err != nil {
-		return nil, err
-	}
-	f, err := os.OpenFile(s.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o640)
+	s := &FileStore{dir: dir, logPath: filepath.Join(dir, "events.jsonl"), snapshotPath: filepath.Join(dir, "projection.json"), lockPath: filepath.Join(dir, ".store.lock")}
+	// 锁文件在 Open 时创建并保持打开，用于在 Commit 期间串行化跨实例追加。
+	lockFile, err := os.OpenFile(s.lockPath, os.O_CREATE|os.O_RDWR, 0o640)
 	if err != nil {
+		return nil, fmt.Errorf("打开目录锁: %w", err)
+	}
+	// 打开日志写入句柄（O_APPEND，单次 Write 原子追加）。允许多个实例各自持有写入句柄，
+	// 但实际追加事件仅在 Commit 期间持有目录锁时进行，因此不会交错产生重复序号。
+	logFile, err := os.OpenFile(s.logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o640)
+	if err != nil {
+		lockFile.Close()
 		return nil, fmt.Errorf("打开事件日志: %w", err)
 	}
-	s.logFile = f
+	s.logFile = logFile
+	s.lockFile = lockFile
+	// 恢复期间独占持有目录锁，确保读取到一致的链尾与投影快照。
+	if err := lockDirExclusive(s.lockFile); err != nil {
+		s.releaseLocks()
+		return nil, fmt.Errorf("锁定持久化目录: %w", err)
+	}
+	recoverErr := s.recover()
+	if unlockErr := unlockDirExclusive(s.lockFile); unlockErr != nil && recoverErr == nil {
+		recoverErr = fmt.Errorf("释放目录锁: %w", unlockErr)
+	}
+	if recoverErr != nil {
+		s.releaseLocks()
+		return nil, recoverErr
+	}
 	return s, nil
+}
+
+// releaseLocks closes any opened log/lock handles without mutating state.
+func (s *FileStore) releaseLocks() {
+	if s.logFile != nil {
+		s.logFile.Close()
+		s.logFile = nil
+	}
+	if s.lockFile != nil {
+		s.lockFile.Close()
+		s.lockFile = nil
+	}
 }
 
 func emptySnapshot() snapshot {
@@ -214,8 +246,13 @@ func (s *FileStore) GetIdempotency(key string) (json.RawMessage, bool) {
 }
 
 func (s *FileStore) Health() (HealthReport, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 健康检查期间持有目录锁，避免读到被并发提交部分写入的日志或投影快照。
+	if err := lockDirExclusive(s.lockFile); err != nil {
+		return HealthReport{}, fmt.Errorf("锁定持久化目录: %w", err)
+	}
+	defer func() { _ = unlockDirExclusive(s.lockFile) }()
 	replayed, err := replayLog(s.logPath)
 	if err != nil {
 		return HealthReport{}, fmt.Errorf("事件日志完整性检查失败: %w", err)
@@ -236,6 +273,17 @@ func (s *FileStore) Health() (HealthReport, error) {
 func (s *FileStore) Commit(packageID string, expectedVersion int64, eventType string, aggregate *domain.SurveyPackage, idempotencyKey string, result json.RawMessage) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// 数据目录级别的独占锁：将跨实例的追加事件串行化，确保每次提交都依据真实的全局链尾，
+	// 产出唯一且连续的序号，避免两个实例依据同一过期链尾并发写入同一序号。
+	if err := lockDirExclusive(s.lockFile); err != nil {
+		return fmt.Errorf("锁定持久化目录: %w", err)
+	}
+	defer func() { _ = unlockDirExclusive(s.lockFile) }()
+	// 锁内重读日志尾部：目录锁保证此期间没有其它实例并发追加，但内存状态可能落后于
+	// 在本实例取得锁之前由其它实例写入的事件，故以日志为准重建投影，使后续事件衔接真实链尾。
+	if err := s.resyncChainTailLocked(); err != nil {
+		return fmt.Errorf("同步事件链尾: %w", err)
+	}
 	current := int64(0)
 	if p := s.state.Packages[packageID]; p != nil {
 		current = p.Version
@@ -270,6 +318,8 @@ func (s *FileStore) Commit(packageID string, expectedVersion int64, eventType st
 		return err
 	}
 	line = append(line, '\n')
+	// 在 O_APPEND 下单次 Write 追加整行事件：内核以写入请求的偏移原子地追加到文件尾，
+	// 配合目录锁与进程内互斥锁，保证并发提交不会交错产生重复序号。
 	written, err := s.logFile.Write(line)
 	if err != nil {
 		return fmt.Errorf("追加事件: %w", err)
@@ -285,6 +335,36 @@ func (s *FileStore) Commit(packageID string, expectedVersion int64, eventType st
 	s.state.LastSequence, s.state.LastHash = event.Sequence, event.Hash
 	if err := s.writeSnapshotLocked(); err != nil {
 		return err
+	}
+	return nil
+}
+
+// resyncChainTailLocked re-reads the event log tail and reconciles in-memory
+// state with the durable chain. Under the directory lock the on-disk chain is
+// authoritative; this guards against any scenario where the in-memory snapshot
+// could be stale relative to the appended log. If the log has advanced beyond
+// the in-memory state (e.g. external edits while the lock was briefly held by
+// another instance), the in-memory state is rebuilt from the log so the next
+// event continues the existing global chain. Any inconsistency is surfaced as
+// an error to avoid silently breaking the chain.
+func (s *FileStore) resyncChainTailLocked() error {
+	replayed, err := replayLog(s.logPath)
+	if err != nil {
+		return err
+	}
+	if replayed.LastSequence < s.state.LastSequence {
+		return fmt.Errorf("事件日志疑似被截短：内存序号 %d，日志序号 %d", s.state.LastSequence, replayed.LastSequence)
+	}
+	if replayed.LastSequence > s.state.LastSequence {
+		// 日志已领先于内存：以日志为准重建投影，确保后续事件衔接真实链尾。
+		s.state = replayed
+		if err := s.writeSnapshotLocked(); err != nil {
+			return fmt.Errorf("重建投影快照: %w", err)
+		}
+		return nil
+	}
+	if replayed.LastHash != s.state.LastHash {
+		return fmt.Errorf("事件链尾哈希不一致：内存 %s，日志 %s", s.state.LastHash, replayed.LastHash)
 	}
 	return nil
 }
@@ -363,10 +443,6 @@ func cloneRaw(in json.RawMessage) json.RawMessage {
 func (s *FileStore) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.logFile == nil {
-		return nil
-	}
-	err := s.logFile.Close()
-	s.logFile = nil
-	return err
+	s.releaseLocks()
+	return nil
 }
