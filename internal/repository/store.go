@@ -346,7 +346,98 @@ func clonePackage(p *domain.SurveyPackage) (*domain.SurveyPackage, error) {
 		return nil, fmt.Errorf("成果包不能为空")
 	}
 	out := *p
+	out.LayerSummaries = append([]domain.LayerSummary(nil), p.LayerSummaries...)
+	out.SensitiveSites = cloneSensitiveSites(p.SensitiveSites)
+	out.SensitiveSiteHistory = cloneSensitiveSiteHistory(p.SensitiveSiteHistory)
+	out.RedactionRevisions = cloneRedactionRevisions(p.RedactionRevisions)
+	out.Findings = cloneFindings(p.Findings)
+	out.Audit = append([]domain.AuditEvent(nil), p.Audit...)
+	if p.Credential != nil {
+		cred := *p.Credential
+		out.Credential = &cred
+	}
+	if p.ReleaseManifest != nil {
+		manifest := *p.ReleaseManifest
+		manifest.Layers = append([]domain.ManifestLayer(nil), p.ReleaseManifest.Layers...)
+		manifest.TransformationSummary = append([]domain.TransformationCount(nil), p.ReleaseManifest.TransformationSummary...)
+		out.ReleaseManifest = &manifest
+	}
 	return &out, nil
+}
+
+func cloneSensitiveSites(in []domain.SensitiveSite) []domain.SensitiveSite {
+	if in == nil {
+		return nil
+	}
+	out := make([]domain.SensitiveSite, len(in))
+	copy(out, in)
+	return out
+}
+
+func cloneSensitiveSiteHistory(in map[string][]domain.SensitiveSite) map[string][]domain.SensitiveSite {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string][]domain.SensitiveSite, len(in))
+	for key, sites := range in {
+		out[key] = cloneSensitiveSites(sites)
+	}
+	return out
+}
+
+func cloneRedactionRevisions(in []domain.RedactionRevision) []domain.RedactionRevision {
+	if in == nil {
+		return nil
+	}
+	out := make([]domain.RedactionRevision, len(in))
+	for i := range in {
+		rev := in[i]
+		rev.Transformations = append([]domain.Transformation(nil), in[i].Transformations...)
+		rev.TransformationImpacts = append([]domain.TransformationImpact(nil), in[i].TransformationImpacts...)
+		for j := range rev.TransformationImpacts {
+			rev.TransformationImpacts[j].AffectedLayers = append([]string(nil), rev.TransformationImpacts[j].AffectedLayers...)
+		}
+		rev.PublicLayers = make([]domain.PublicLayer, len(in[i].PublicLayers))
+		for j := range in[i].PublicLayers {
+			rev.PublicLayers[j].Name = in[i].PublicLayers[j].Name
+			rev.PublicLayers[j].Features = make([]domain.PublicFeature, len(in[i].PublicLayers[j].Features))
+			copy(rev.PublicLayers[j].Features, in[i].PublicLayers[j].Features)
+			for k := range rev.PublicLayers[j].Features {
+				if in[i].PublicLayers[j].Features[k].Coordinate != nil {
+					c := *in[i].PublicLayers[j].Features[k].Coordinate
+					rev.PublicLayers[j].Features[k].Coordinate = &c
+				}
+			}
+		}
+		rev.RemediationMappings = make([]domain.RemediationMapping, len(in[i].RemediationMappings))
+		copy(rev.RemediationMappings, in[i].RemediationMappings)
+		for j := range rev.RemediationMappings {
+			if in[i].RemediationMappings[j].TransformationIndex != nil {
+				idx := *in[i].RemediationMappings[j].TransformationIndex
+				rev.RemediationMappings[j].TransformationIndex = &idx
+			}
+		}
+		rev.RemediationResults = append([]domain.RemediationResult(nil), in[i].RemediationResults...)
+		out[i] = rev
+	}
+	return out
+}
+
+func cloneFindings(in []domain.ReviewFinding) []domain.ReviewFinding {
+	if in == nil {
+		return nil
+	}
+	out := make([]domain.ReviewFinding, len(in))
+	for i := range in {
+		f := in[i]
+		if in[i].DecidedAt != nil {
+			t := *in[i].DecidedAt
+			f.DecidedAt = &t
+		}
+		f.DecisionHistory = append([]domain.FindingDecisionRecord(nil), in[i].DecisionHistory...)
+		out[i] = f
+	}
+	return out
 }
 
 func cloneRaw(in json.RawMessage) json.RawMessage {
