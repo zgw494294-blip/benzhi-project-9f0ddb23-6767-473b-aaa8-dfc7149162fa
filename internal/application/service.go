@@ -1,6 +1,7 @@
 package application
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -246,22 +247,26 @@ func (s *Service) CreatePackage(cmd CreatePackageCommand, idempotencyKey string)
 		return MutationResult{}, err
 	}
 	result := MutationResult{Package: packageView(p)}
-	if err := s.commit(id, 0, "package.created", p, scope, result); err != nil {
+	if err := s.commit(context.Background(), id, 0, "package.created", p, scope, result); err != nil {
 		return MutationResult{}, err
 	}
 	return result, nil
 }
 
 func (s *Service) AddSensitiveSite(packageID string, cmd AddSensitiveSiteCommand, idempotencyKey string) (MutationResult, error) {
+	return s.AddSensitiveSiteCtx(context.Background(), packageID, cmd, idempotencyKey)
+}
+
+func (s *Service) AddSensitiveSiteCtx(ctx context.Context, packageID string, cmd AddSensitiveSiteCommand, idempotencyKey string) (MutationResult, error) {
 	scope := "site:" + packageID + ":" + idempotencyKey
-	return s.mutate(packageID, cmd.ExpectedVersion, scope, "sensitive_site.recorded", func(p *domain.SurveyPackage) error {
+	return s.mutate(ctx, packageID, cmd.ExpectedVersion, scope, "sensitive_site.recorded", func(p *domain.SurveyPackage) error {
 		return p.AddSensitiveSite(domain.SensitiveSite{ID: s.ids("site"), Category: cmd.Category, OriginalCoordinate: cmd.OriginalCoordinate, ProtectionReason: cmd.ProtectionReason, RecommendedPrecisionMeters: cmd.RecommendedPrecisionMeters, RecordedBy: cmd.RecordedBy}, s.now())
 	})
 }
 
 func (s *Service) ReviseMetadata(packageID string, cmd ReviseMetadataCommand, idempotencyKey string) (MutationResult, error) {
 	scope := "metadata:" + packageID + ":" + idempotencyKey
-	return s.mutate(packageID, cmd.ExpectedVersion, scope, "package.metadata_revised", func(p *domain.SurveyPackage) error {
+	return s.mutate(context.Background(), packageID, cmd.ExpectedVersion, scope, "package.metadata_revised", func(p *domain.SurveyPackage) error {
 		if cmd.Actor != "" && cmd.RevisedBy != "" && cmd.Actor != cmd.RevisedBy {
 			return domain.Invalid("revisedBy", "与 actor 不得冲突")
 		}
@@ -275,14 +280,14 @@ func (s *Service) ReviseMetadata(packageID string, cmd ReviseMetadataCommand, id
 
 func (s *Service) ReviseSensitiveSite(packageID, siteID string, cmd ReviseSensitiveSiteCommand, idempotencyKey string) (MutationResult, error) {
 	scope := "site-revision:" + packageID + ":" + siteID + ":" + idempotencyKey
-	return s.mutate(packageID, cmd.ExpectedVersion, scope, "sensitive_site.revised", func(p *domain.SurveyPackage) error {
+	return s.mutate(context.Background(), packageID, cmd.ExpectedVersion, scope, "sensitive_site.revised", func(p *domain.SurveyPackage) error {
 		return p.ReviseSensitiveSite(siteID, cmd.SupersedesRevision, domain.SensitiveSite{Category: cmd.Category, OriginalCoordinate: cmd.OriginalCoordinate, ProtectionReason: cmd.ProtectionReason, RecommendedPrecisionMeters: cmd.RecommendedPrecisionMeters, RecordedBy: cmd.RecordedBy}, cmd.CorrectionReason, s.now())
 	})
 }
 
 func (s *Service) SubmitRevision(packageID string, cmd SubmitRevisionCommand, idempotencyKey string) (MutationResult, error) {
 	scope := "revision:" + packageID + ":" + idempotencyKey
-	return s.mutate(packageID, cmd.ExpectedVersion, scope, "redaction.checked", func(p *domain.SurveyPackage) error {
+	return s.mutate(context.Background(), packageID, cmd.ExpectedVersion, scope, "redaction.checked", func(p *domain.SurveyPackage) error {
 		preview, err := domain.PreviewTransformations(cmd.PublicLayers, p.SensitiveSites, cmd.Transformations)
 		if err != nil {
 			return err
@@ -327,7 +332,7 @@ func decisionsFromRequest(input []ReviewDecision) (map[string]domain.FindingDeci
 
 func (s *Service) SaveReviewDecisions(packageID string, cmd SaveDecisionsCommand, idempotencyKey string) (MutationResult, error) {
 	scope := "review-decisions:" + packageID + ":" + idempotencyKey
-	return s.mutate(packageID, cmd.ExpectedVersion, scope, "review.decisions_saved", func(p *domain.SurveyPackage) error {
+	return s.mutate(context.Background(), packageID, cmd.ExpectedVersion, scope, "review.decisions_saved", func(p *domain.SurveyPackage) error {
 		decisions, err := decisionsFromRequest(cmd.Decisions)
 		if err != nil {
 			return err
@@ -341,7 +346,7 @@ func (s *Service) SaveReviewDecisions(packageID string, cmd SaveDecisionsCommand
 
 func (s *Service) CompleteReview(packageID string, cmd CompleteReviewCommand, idempotencyKey string) (MutationResult, error) {
 	scope := "review:" + packageID + ":" + idempotencyKey
-	return s.mutate(packageID, cmd.ExpectedVersion, scope, "review.completed", func(p *domain.SurveyPackage) error {
+	return s.mutate(context.Background(), packageID, cmd.ExpectedVersion, scope, "review.completed", func(p *domain.SurveyPackage) error {
 		decisions, err := decisionsFromRequest(cmd.Decisions)
 		if err != nil {
 			return err
@@ -377,7 +382,7 @@ func (s *Service) Freeze(packageID string, cmd FreezeCommand, idempotencyKey str
 		return FreezeResult{}, err
 	}
 	result := FreezeResult{Package: packageView(p), Credential: *credential, ReleaseManifest: *p.ReleaseManifest}
-	if err := s.commit(packageID, cmd.ExpectedVersion, "release.published", p, scope, result); err != nil {
+	if err := s.commit(context.Background(), packageID, cmd.ExpectedVersion, "release.published", p, scope, result); err != nil {
 		return FreezeResult{}, err
 	}
 	return result, nil
@@ -552,7 +557,7 @@ func (s *Service) DiagnoseCredential(cmd VerifyCredentialCommand) (VerifyCredent
 	return result, nil
 }
 
-func (s *Service) mutate(packageID string, expectedVersion int64, scope, eventType string, mutation func(*domain.SurveyPackage) error) (MutationResult, error) {
+func (s *Service) mutate(ctx context.Context, packageID string, expectedVersion int64, scope, eventType string, mutation func(*domain.SurveyPackage) error) (MutationResult, error) {
 	if result, ok := loadResult[MutationResult](s.store, scope); ok {
 		return result, nil
 	}
@@ -571,17 +576,29 @@ func (s *Service) mutate(packageID string, expectedVersion int64, scope, eventTy
 	if err := mutation(p); err != nil {
 		return MutationResult{}, err
 	}
+	// 在持有锁的情况下提交前再次校验请求是否已取消，避免取消后的请求写入任何变更。
+	if err := ctx.Err(); err != nil {
+		return MutationResult{}, err
+	}
 	result := MutationResult{Package: packageView(p)}
-	if err := s.commit(packageID, expectedVersion, eventType, p, scope, result); err != nil {
+	if err := s.commit(ctx, packageID, expectedVersion, eventType, p, scope, result); err != nil {
 		return MutationResult{}, err
 	}
 	return result, nil
 }
 
-func (s *Service) commit(packageID string, expected int64, eventType string, p *domain.SurveyPackage, scope string, result any) error {
+func (s *Service) commit(ctx context.Context, packageID string, expected int64, eventType string, p *domain.SurveyPackage, scope string, result any) error {
+	// 进入持久化前最后校验取消状态，确保已取消的请求不会落盘事件与投影。
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	b, err := json.Marshal(result)
 	if err != nil {
 		return err
+	}
+	// 优先使用支持 context 的提交实现，使存储在写入前后仍可拒绝已取消的请求。
+	if committer, ok := s.store.(repository.CommitterCtx); ok {
+		return committer.CommitCtx(ctx, packageID, expected, eventType, p, scope, b)
 	}
 	return s.store.Commit(packageID, expected, eventType, p, scope, b)
 }

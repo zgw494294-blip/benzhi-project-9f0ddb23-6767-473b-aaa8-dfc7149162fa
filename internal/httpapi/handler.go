@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -201,12 +202,12 @@ func (h *Handler) AddSensitiveSite(w http.ResponseWriter, r *http.Request) {
 	}
 	completed := make(chan outcome, 1)
 	go func() {
-		result, err := h.service.AddSensitiveSite(r.PathValue("packageId"), cmd, key)
+		result, err := h.service.AddSensitiveSiteCtx(r.Context(), r.PathValue("packageId"), cmd, key)
 		completed <- outcome{result: result, err: err}
 	}()
 	select {
 	case <-r.Context().Done():
-		mapError(w, r, r.Context().Err())
+		writeError(w, http.StatusServiceUnavailable, "request_canceled", "请求已取消，未提交任何变更", correlationID(w))
 		<-completed
 		return
 	case finished := <-completed:
@@ -407,6 +408,10 @@ func protocolError(w http.ResponseWriter, r *http.Request, message string) {
 }
 
 func mapError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		writeError(w, http.StatusServiceUnavailable, "request_canceled", "请求已取消，未提交任何变更", correlationID(w))
+		return
+	}
 	if errors.Is(err, application.ErrStorageIntegrity) {
 		writeError(w, http.StatusServiceUnavailable, "storage_integrity_failed", "存储完整性检查失败", correlationID(w))
 		return

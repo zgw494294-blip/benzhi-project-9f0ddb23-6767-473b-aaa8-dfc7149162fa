@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"context"
 	"encoding/json"
 	"sync"
 
@@ -35,6 +36,11 @@ func (m *MemoryStore) GetIdempotency(key string) (json.RawMessage, bool) {
 }
 
 func (m *MemoryStore) Commit(id string, expected int64, eventType string, aggregate *domain.SurveyPackage, key string, result json.RawMessage) error {
+	return m.CommitCtx(context.Background(), id, expected, eventType, aggregate, key, result)
+}
+
+// CommitCtx 在写入内存投影前校验请求取消状态，保证已取消的请求不会修改任何状态。
+func (m *MemoryStore) CommitCtx(ctx context.Context, id string, expected int64, eventType string, aggregate *domain.SurveyPackage, key string, result json.RawMessage) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	current := int64(0)
@@ -50,8 +56,14 @@ func (m *MemoryStore) Commit(id string, expected int64, eventType string, aggreg
 	if _, ok := m.idempotency[key]; ok {
 		return domain.Conflict("幂等键冲突")
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	copyAggregate, err := clonePackage(aggregate)
 	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	m.packages[id] = copyAggregate

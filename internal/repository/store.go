@@ -3,6 +3,7 @@ package repository
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -27,6 +28,12 @@ type Store interface {
 	Commit(packageID string, expectedVersion int64, eventType string, aggregate *domain.SurveyPackage, idempotencyKey string, result json.RawMessage) error
 	Health() (HealthReport, error)
 	Close() error
+}
+
+// CommitterCtx 是可选的 context 感知提交能力。实现了该接口的存储在持久化前会校验请求取消状态，
+// 从而保证读取流程与提交之间被取消的请求不会落盘任何变更。
+type CommitterCtx interface {
+	CommitCtx(ctx context.Context, packageID string, expectedVersion int64, eventType string, aggregate *domain.SurveyPackage, idempotencyKey string, result json.RawMessage) error
 }
 
 type HealthReport struct {
@@ -234,6 +241,16 @@ func (s *FileStore) Health() (HealthReport, error) {
 }
 
 func (s *FileStore) Commit(packageID string, expectedVersion int64, eventType string, aggregate *domain.SurveyPackage, idempotencyKey string, result json.RawMessage) error {
+	return s.commitWithCtx(context.Background(), packageID, expectedVersion, eventType, aggregate, idempotencyKey, result)
+}
+
+func (s *FileStore) CommitCtx(ctx context.Context, packageID string, expectedVersion int64, eventType string, aggregate *domain.SurveyPackage, idempotencyKey string, result json.RawMessage) error {
+	return s.commitWithCtx(ctx, packageID, expectedVersion, eventType, aggregate, idempotencyKey, result)
+}
+
+// commitWithCtx 在持有写锁的临界区内多次校验请求取消状态，确保读取流程开始后取消的请求
+// 不会写入事件日志与投影快照。
+func (s *FileStore) commitWithCtx(ctx context.Context, packageID string, expectedVersion int64, eventType string, aggregate *domain.SurveyPackage, idempotencyKey string, result json.RawMessage) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	current := int64(0)
@@ -251,6 +268,10 @@ func (s *FileStore) Commit(packageID string, expectedVersion int64, eventType st
 	}
 	if _, exists := s.state.Idempotency[idempotencyKey]; exists {
 		return fmt.Errorf("幂等键已由并发请求提交")
+	}
+	// 读取流程完成、准备写入事件前再次校验取消状态。
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	copyAggregate, err := clonePackage(aggregate)
 	if err != nil {
@@ -270,6 +291,10 @@ func (s *FileStore) Commit(packageID string, expectedVersion int64, eventType st
 		return err
 	}
 	line = append(line, '\n')
+	// 落盘前最后校验取消状态，保证已取消的请求不会写入事件日志与投影。
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	written, err := s.logFile.Write(line)
 	if err != nil {
 		return fmt.Errorf("追加事件: %w", err)
