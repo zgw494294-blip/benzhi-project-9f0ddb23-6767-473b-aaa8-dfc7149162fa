@@ -14,37 +14,14 @@ import (
 )
 
 type Service struct {
-	store        repository.Store
-	now          func() time.Time
-	ids          func(string) string
-	locks        *keyedLocks
-	packageCache *packageCache
+	store repository.Store
+	now   func() time.Time
+	ids   func(string) string
+	locks *keyedLocks
 }
 
 func NewService(store repository.Store) *Service {
-	return &Service{store: store, now: time.Now, ids: randomID, locks: newKeyedLocks(), packageCache: newPackageCache()}
-}
-
-type packageCache struct {
-	mu      sync.RWMutex
-	entries map[string]*domain.SurveyPackage
-}
-
-func newPackageCache() *packageCache {
-	return &packageCache{entries: map[string]*domain.SurveyPackage{}}
-}
-
-func (c *packageCache) load(packageID string) (*domain.SurveyPackage, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	p, ok := c.entries[packageID]
-	return p, ok
-}
-
-func (c *packageCache) store(packageID string, p *domain.SurveyPackage) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.entries[packageID] = p
+	return &Service{store: store, now: time.Now, ids: randomID, locks: newKeyedLocks()}
 }
 
 type CreatePackageCommand struct {
@@ -609,19 +586,14 @@ func (s *Service) commit(packageID string, expected int64, eventType string, p *
 	if err := s.store.Commit(packageID, expected, eventType, p, scope, b); err != nil {
 		return err
 	}
-	s.packageCache.store(packageID, p)
 	return nil
 }
 
 func (s *Service) loadPackage(packageID string) (*domain.SurveyPackage, error) {
-	if p, ok := s.packageCache.load(packageID); ok {
-		return p, nil
-	}
 	p, err := s.store.Get(packageID)
 	if err != nil {
 		return nil, err
 	}
-	s.packageCache.store(packageID, p)
 	return p, nil
 }
 
