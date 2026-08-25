@@ -342,14 +342,10 @@ func eventHash(event EventEnvelope) (string, error) {
 }
 
 func clonePackage(p *domain.SurveyPackage) (*domain.SurveyPackage, error) {
-	b, err := json.Marshal(p)
-	if err != nil {
-		return nil, err
+	if p == nil {
+		return nil, fmt.Errorf("成果包不能为空")
 	}
-	var out domain.SurveyPackage
-	if err := json.Unmarshal(b, &out); err != nil {
-		return nil, err
-	}
+	out := *p
 	return &out, nil
 }
 
