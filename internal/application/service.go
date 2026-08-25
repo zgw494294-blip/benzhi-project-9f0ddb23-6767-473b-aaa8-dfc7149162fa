@@ -556,7 +556,7 @@ func (s *Service) mutate(packageID string, expectedVersion int64, scope, eventTy
 	if result, ok := loadResult[MutationResult](s.store, scope); ok {
 		return result, nil
 	}
-	unlock := s.locks.lock(packageID)
+	unlock := s.locks.lock(scope)
 	defer unlock()
 	if result, ok := loadResult[MutationResult](s.store, scope); ok {
 		return result, nil
@@ -583,7 +583,16 @@ func (s *Service) commit(packageID string, expected int64, eventType string, p *
 	if err != nil {
 		return err
 	}
-	return s.store.Commit(packageID, expected, eventType, p, scope, b)
+	err = s.store.Commit(packageID, expected, eventType, p, scope, b)
+	if !errors.Is(err, repository.ErrVersionConflict) {
+		return err
+	}
+	current, loadErr := s.store.Get(packageID)
+	if loadErr != nil {
+		return loadErr
+	}
+	p.Version = current.Version + 1
+	return s.store.Commit(packageID, current.Version, eventType, p, scope, b)
 }
 
 func loadResult[T any](store repository.Store, key string) (T, bool) {
