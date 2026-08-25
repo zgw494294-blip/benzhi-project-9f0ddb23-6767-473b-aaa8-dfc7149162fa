@@ -195,12 +195,27 @@ func (h *Handler) AddSensitiveSite(w http.ResponseWriter, r *http.Request) {
 		protocolError(w, r, "expectedVersion 必须大于零")
 		return
 	}
-	result, err := h.service.AddSensitiveSite(r.PathValue("packageId"), cmd, key)
-	if err != nil {
-		mapError(w, r, err)
-		return
+	type outcome struct {
+		result application.MutationResult
+		err    error
 	}
-	writeJSON(w, http.StatusOK, result)
+	completed := make(chan outcome, 1)
+	go func() {
+		result, err := h.service.AddSensitiveSite(r.PathValue("packageId"), cmd, key)
+		completed <- outcome{result: result, err: err}
+	}()
+	select {
+	case <-r.Context().Done():
+		mapError(w, r, r.Context().Err())
+		<-completed
+		return
+	case finished := <-completed:
+		if finished.err != nil {
+			mapError(w, r, finished.err)
+			return
+		}
+		writeJSON(w, http.StatusOK, finished.result)
+	}
 }
 
 func (h *Handler) SubmitRevision(w http.ResponseWriter, r *http.Request) {
