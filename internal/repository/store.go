@@ -92,11 +92,18 @@ func emptySnapshot() snapshot {
 }
 
 func (s *FileStore) recover() error {
+	onDisk, snapErr := readSnapshot(s.snapshotPath)
+	if snapErr == nil {
+		matches, err := logTailMatchesSnapshot(s.logPath, onDisk)
+		if err == nil && matches {
+			s.state = onDisk
+			return nil
+		}
+	}
 	replayed, err := replayLog(s.logPath)
 	if err != nil {
 		return fmt.Errorf("验证事件日志失败: %w", err)
 	}
-	onDisk, snapErr := readSnapshot(s.snapshotPath)
 	if snapErr == nil && onDisk.LastSequence > replayed.LastSequence {
 		return fmt.Errorf("事件日志疑似被截短：快照序号 %d，日志序号 %d", onDisk.LastSequence, replayed.LastSequence)
 	}
@@ -109,6 +116,41 @@ func (s *FileStore) recover() error {
 		return fmt.Errorf("重建投影快照: %w", err)
 	}
 	return nil
+}
+
+func logTailMatchesSnapshot(path string, state snapshot) (bool, error) {
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return state.LastSequence == 0 && state.LastHash == "", nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
+	var tail []byte
+	for scanner.Scan() {
+		if line := bytes.TrimSpace(scanner.Bytes()); len(line) > 0 {
+			tail = append(tail[:0], line...)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return false, err
+	}
+	if len(tail) == 0 {
+		return state.LastSequence == 0 && state.LastHash == "", nil
+	}
+	var event EventEnvelope
+	if err := json.Unmarshal(tail, &event); err != nil {
+		return false, err
+	}
+	expected, err := eventHash(event)
+	if err != nil {
+		return false, err
+	}
+	return event.SchemaVersion == schemaVersion && event.Sequence == state.LastSequence && event.Hash == state.LastHash && event.Hash == expected, nil
 }
 
 func replayLog(path string) (snapshot, error) {
