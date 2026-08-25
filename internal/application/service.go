@@ -14,10 +14,13 @@ import (
 )
 
 type Service struct {
-	store repository.Store
-	now   func() time.Time
-	ids   func(string) string
-	locks *keyedLocks
+	store        repository.Store
+	now          func() time.Time
+	ids          func(string) string
+	locks        *keyedLocks
+	healthOnce   sync.Once
+	healthResult HealthView
+	healthErr    error
 }
 
 func NewService(store repository.Store) *Service {
@@ -469,11 +472,16 @@ func (s *Service) GetRevisions(packageID string) ([]RevisionView, error) {
 }
 
 func (s *Service) Health() (HealthView, error) {
-	report, err := s.store.Health()
-	if err != nil {
-		return HealthView{Status: "degraded", CheckedAt: s.now().UTC()}, err
-	}
-	return HealthView{Status: "ok", CheckedAt: s.now().UTC(), SchemaVersion: report.SchemaVersion, EventSequence: report.EventSequence, PackageCount: report.PackageCount, Integrity: report.Integrity}, nil
+	s.healthOnce.Do(func() {
+		report, err := s.store.Health()
+		if err != nil {
+			s.healthResult = HealthView{Status: "degraded", CheckedAt: s.now().UTC()}
+			s.healthErr = err
+			return
+		}
+		s.healthResult = HealthView{Status: "ok", CheckedAt: s.now().UTC(), SchemaVersion: report.SchemaVersion, EventSequence: report.EventSequence, PackageCount: report.PackageCount, Integrity: report.Integrity}
+	})
+	return s.healthResult, s.healthErr
 }
 
 func (s *Service) GetCredential(packageID string) (*CredentialView, error) {
