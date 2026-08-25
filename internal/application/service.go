@@ -14,14 +14,37 @@ import (
 )
 
 type Service struct {
-	store repository.Store
-	now   func() time.Time
-	ids   func(string) string
-	locks *keyedLocks
+	store        repository.Store
+	now          func() time.Time
+	ids          func(string) string
+	locks        *keyedLocks
+	packageCache *packageCache
 }
 
 func NewService(store repository.Store) *Service {
-	return &Service{store: store, now: time.Now, ids: randomID, locks: newKeyedLocks()}
+	return &Service{store: store, now: time.Now, ids: randomID, locks: newKeyedLocks(), packageCache: newPackageCache()}
+}
+
+type packageCache struct {
+	mu      sync.RWMutex
+	entries map[string]*domain.SurveyPackage
+}
+
+func newPackageCache() *packageCache {
+	return &packageCache{entries: map[string]*domain.SurveyPackage{}}
+}
+
+func (c *packageCache) load(packageID string) (*domain.SurveyPackage, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	p, ok := c.entries[packageID]
+	return p, ok
+}
+
+func (c *packageCache) store(packageID string, p *domain.SurveyPackage) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[packageID] = p
 }
 
 type CreatePackageCommand struct {
@@ -301,7 +324,7 @@ func (s *Service) SubmitRevision(packageID string, cmd SubmitRevisionCommand, id
 }
 
 func (s *Service) PreviewRevision(packageID string, cmd PreviewRevisionCommand) (domain.TransformationPreview, error) {
-	p, err := s.store.Get(packageID)
+	p, err := s.loadPackage(packageID)
 	if err != nil {
 		return domain.TransformationPreview{}, err
 	}
@@ -384,7 +407,7 @@ func (s *Service) Freeze(packageID string, cmd FreezeCommand, idempotencyKey str
 }
 
 func (s *Service) GetPackage(packageID string) (PackageView, error) {
-	p, err := s.store.Get(packageID)
+	p, err := s.loadPackage(packageID)
 	if err != nil {
 		return PackageView{}, err
 	}
@@ -392,7 +415,7 @@ func (s *Service) GetPackage(packageID string) (PackageView, error) {
 }
 
 func (s *Service) GetFindings(packageID string) ([]domain.ReviewFinding, error) {
-	p, err := s.store.Get(packageID)
+	p, err := s.loadPackage(packageID)
 	if err != nil {
 		return nil, err
 	}
@@ -400,7 +423,7 @@ func (s *Service) GetFindings(packageID string) ([]domain.ReviewFinding, error) 
 }
 
 func (s *Service) GetCheckReport(packageID string) (CheckReportView, error) {
-	p, err := s.store.Get(packageID)
+	p, err := s.loadPackage(packageID)
 	if err != nil {
 		return CheckReportView{}, err
 	}
@@ -429,7 +452,7 @@ func (s *Service) GetCheckReport(packageID string) (CheckReportView, error) {
 }
 
 func (s *Service) GetSensitiveSites(packageID string) ([]SensitiveSiteView, error) {
-	p, err := s.store.Get(packageID)
+	p, err := s.loadPackage(packageID)
 	if err != nil {
 		return nil, err
 	}
@@ -437,7 +460,7 @@ func (s *Service) GetSensitiveSites(packageID string) ([]SensitiveSiteView, erro
 }
 
 func (s *Service) GetSensitiveSiteHistory(packageID, siteID string) ([]SensitiveSiteView, error) {
-	p, err := s.store.Get(packageID)
+	p, err := s.loadPackage(packageID)
 	if err != nil {
 		return nil, err
 	}
@@ -461,7 +484,7 @@ func (s *Service) GetSensitiveSiteHistory(packageID, siteID string) ([]Sensitive
 }
 
 func (s *Service) GetRevisions(packageID string) ([]RevisionView, error) {
-	p, err := s.store.Get(packageID)
+	p, err := s.loadPackage(packageID)
 	if err != nil {
 		return nil, err
 	}
@@ -480,7 +503,7 @@ func (s *Service) GetCredential(packageID string) (*CredentialView, error) {
 	if _, err := s.store.Health(); err != nil {
 		return nil, ErrStorageIntegrity
 	}
-	p, err := s.store.Get(packageID)
+	p, err := s.loadPackage(packageID)
 	if err != nil {
 		return nil, err
 	}
@@ -499,7 +522,7 @@ func (s *Service) GetCredential(packageID string) (*CredentialView, error) {
 }
 
 func (s *Service) VerifyCredential(packageID, verificationHash string) (bool, error) {
-	p, err := s.store.Get(packageID)
+	p, err := s.loadPackage(packageID)
 	if err != nil {
 		return false, err
 	}
@@ -512,7 +535,7 @@ func (s *Service) DiagnoseCredential(cmd VerifyCredentialCommand) (VerifyCredent
 	if _, err := s.store.Health(); err != nil {
 		return VerifyCredentialResult{}, ErrStorageIntegrity
 	}
-	p, err := s.store.Get(cmd.PackageID)
+	p, err := s.loadPackage(cmd.PackageID)
 	if err != nil {
 		return VerifyCredentialResult{}, err
 	}
@@ -583,7 +606,23 @@ func (s *Service) commit(packageID string, expected int64, eventType string, p *
 	if err != nil {
 		return err
 	}
-	return s.store.Commit(packageID, expected, eventType, p, scope, b)
+	if err := s.store.Commit(packageID, expected, eventType, p, scope, b); err != nil {
+		return err
+	}
+	s.packageCache.store(packageID, p)
+	return nil
+}
+
+func (s *Service) loadPackage(packageID string) (*domain.SurveyPackage, error) {
+	if p, ok := s.packageCache.load(packageID); ok {
+		return p, nil
+	}
+	p, err := s.store.Get(packageID)
+	if err != nil {
+		return nil, err
+	}
+	s.packageCache.store(packageID, p)
+	return p, nil
 }
 
 func loadResult[T any](store repository.Store, key string) (T, bool) {
