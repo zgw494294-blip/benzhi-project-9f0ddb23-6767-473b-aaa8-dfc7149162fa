@@ -47,9 +47,6 @@ func (m *MemoryStore) Commit(id string, expected int64, eventType string, aggreg
 	if aggregate == nil || aggregate.Version != expected+1 {
 		return domain.Conflict("提交版本无效")
 	}
-	if _, ok := m.idempotency[key]; ok {
-		return domain.Conflict("幂等键冲突")
-	}
 	copyAggregate, err := clonePackage(aggregate)
 	if err != nil {
 		return err

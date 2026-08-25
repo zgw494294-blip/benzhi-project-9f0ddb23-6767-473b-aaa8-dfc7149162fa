@@ -249,9 +249,6 @@ func (s *FileStore) Commit(packageID string, expectedVersion int64, eventType st
 	if idempotencyKey == "" {
 		return fmt.Errorf("idempotencyKey 不能为空")
 	}
-	if _, exists := s.state.Idempotency[idempotencyKey]; exists {
-		return fmt.Errorf("幂等键已由并发请求提交")
-	}
 	copyAggregate, err := clonePackage(aggregate)
 	if err != nil {
 		return err
