@@ -121,15 +121,27 @@ func replayLog(path string) (snapshot, error) {
 		return state, err
 	}
 	defer f.Close()
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
-	for scanner.Scan() {
-		line := bytes.TrimSpace(scanner.Bytes())
+	reader := bufio.NewReaderSize(f, 64*1024)
+	for {
+		raw, readErr := reader.ReadBytes('\n')
+		if len(raw) > 8*1024*1024 {
+			return state, fmt.Errorf("第 %d 条事件超过大小限制", state.LastSequence+1)
+		}
+		line := bytes.TrimSpace(raw)
 		if len(line) == 0 {
-			continue
+			if readErr == nil {
+				continue
+			}
+			if errors.Is(readErr, io.EOF) {
+				return state, nil
+			}
+			return state, readErr
 		}
 		var event EventEnvelope
 		if err := json.Unmarshal(line, &event); err != nil {
+			if errors.Is(readErr, io.EOF) {
+				return state, nil
+			}
 			return state, fmt.Errorf("第 %d 条事件 JSON 无效: %w", state.LastSequence+1, err)
 		}
 		if event.SchemaVersion != schemaVersion {
@@ -153,11 +165,13 @@ func replayLog(path string) (snapshot, error) {
 			state.Idempotency[event.IdempotencyKey] = cloneRaw(event.Result)
 		}
 		state.LastSequence, state.LastHash = event.Sequence, event.Hash
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return state, nil
+			}
+			return state, readErr
+		}
 	}
-	if err := scanner.Err(); err != nil {
-		return state, err
-	}
-	return state, nil
 }
 
 func readSnapshot(path string) (snapshot, error) {
